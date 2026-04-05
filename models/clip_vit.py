@@ -31,11 +31,64 @@ class TextEncoder(nn.Module):
         return x
 
 
+class SimpleGCN(nn.Module):
+    """基于特征相似度的简单图卷积网络，用于刻画头类与尾类之间的文本特征联系"""
+    def __init__(self, dim=512, threshold=0.0, topk=None):
+        super().__init__()
+        self.threshold = threshold
+        self.topk = topk
+        self.weight = nn.Linear(dim, dim, bias=False)
+        nn.init.eye_(self.weight.weight)
+
+    def forward(self, x, return_adj=False):
+        """
+        Args:
+            x: [n_cls, dim] 文本特征
+            return_adj: 是否返回归一化邻接矩阵（用于调试/热力图可视化）
+        Returns:
+            out: [n_cls, dim] 增强后的特征
+            adj (optional): [n_cls, n_cls] 归一化邻接矩阵
+        """
+        # 基于余弦相似度构建邻接矩阵
+        x_norm = F.normalize(x, p=2, dim=-1)  # [n_cls, dim]
+        A = x_norm @ x_norm.t()  # [n_cls, n_cls]
+
+        # 阈值稀疏化
+        if self.threshold > 0:
+            A = A * (A > self.threshold).float()
+
+        # topk 稀疏化：只保留与每个类最相似的 k 个连接
+        if self.topk is not None:
+            k = min(self.topk, A.shape[1])
+            _, topk_idx = torch.topk(A, k=k, dim=1)
+            mask = torch.zeros_like(A)
+            mask.scatter_(1, topk_idx, 1.0)
+            A = A * mask
+
+        # 加入自连接
+        A = A + torch.eye(A.shape[0], device=A.device, dtype=A.dtype)
+
+        # 对称归一化: D^(-1/2) A D^(-1/2)
+        deg = A.sum(dim=1)
+        deg_inv_sqrt = deg.pow(-0.5)
+        deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0.0
+        D_inv_sqrt = torch.diag(deg_inv_sqrt)
+        A_norm = D_inv_sqrt @ A @ D_inv_sqrt  # [n_cls, n_cls]
+
+        # GCN: H' = ReLU(A_norm H W)
+        out = F.relu(A_norm @ self.weight(x))  # [n_cls, dim]
+
+        if return_adj:
+            return out, A_norm
+        return out
+
+
 class TextFeatureEnhancer(nn.Module):
-    """文本特征增强：残差 MLP + LayerNorm"""
-    def __init__(self, dim=512, scale=0.1):
+    """文本特征增强：残差 MLP + LayerNorm + SimpleGCN"""
+    def __init__(self, dim=512, scale=0.1, gcn_scale=0.1, gcn_threshold=0.0, gcn_topk=None):
         super().__init__()
         self.scale = scale
+        self.gcn_scale = gcn_scale
         self.mlp = nn.Sequential(
             nn.Linear(dim, dim),
             nn.LayerNorm(dim),
@@ -46,9 +99,21 @@ class TextFeatureEnhancer(nn.Module):
         nn.init.zeros_(self.mlp[0].bias)
         nn.init.xavier_uniform_(self.mlp[3].weight, gain=0.01)
         nn.init.zeros_(self.mlp[3].bias)
+        self.ln = nn.LayerNorm(dim)
+        self.gcn = SimpleGCN(dim=dim, threshold=gcn_threshold, topk=gcn_topk)
 
-    def forward(self, x):
-        return x + self.scale * self.mlp(x)
+    def forward(self, x, return_adj=False):
+        # 残差 MLP
+        x = x + self.scale * self.mlp(x)
+        # LayerNorm
+        x = self.ln(x)
+        # GCN（残差形式，gcn_scale 控制增强强度）
+        if return_adj:
+            gcn_out, adj = self.gcn(x, return_adj=True)
+            x = x + self.gcn_scale * gcn_out
+            return x, adj
+        x = x + self.gcn_scale * self.gcn(x)
+        return x
 
 
 class SimNet(nn.Module):
